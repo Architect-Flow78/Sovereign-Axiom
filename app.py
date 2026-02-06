@@ -1,20 +1,61 @@
-# Rabota
-#!/usr/bin/env python3  import argparse import json import os import gzip import hashlib import logging import time from datetime import datetime from typing import Dict, Callable  import pandas as pd import numpy as np  logging.basicConfig(level=logging.INFO)  # ============================================================ # Utils # ============================================================  def sha256_file(path, block=1 << 20):     h = hashlib.sha256()     with open(path, "rb") as f:         for b in iter(lambda: f.read(block), b""):             h.update(b)     return h.hexdigest()  def open_file(path):     if path.endswith(".gz"):         return gzip.open(path, "rt", encoding="utf-8", errors="replace")     return open(path, "r", encoding="utf-8", errors="replace")  def infer_type(series):     s = series.dropna().head(200)     try:         pd.to_numeric(s, downcast="integer")         return "int"     except:         pass     try:         pd.to_numeric(s)         return "float"     except:         pass     try:         pd.to_datetime(s, errors="raise")         return "datetime"     except:         return "string"  # ============================================================ # Operators # ============================================================  OPERATORS: Dict[str, Callable] = {}  def register_operator(name, fn):     OPERATORS[name] = fn  register_operator(">", lambda s,v: s > v) register_operator("<", lambda s,v: s < v) register_operator(">=", lambda s,v: s >= v) register_operator("<=", lambda s,v: s <= v) register_operator("==", lambda s,v: s == v) register_operator("!=", lambda s,v: s != v) register_operator("contains", lambda s,v: s.astype(str).str.contains(v, na=False)) register_operator("regex", lambda s,v: s.astype(str).str.match(v, na=False)) register_operator("between", lambda s,v: s.between(v[0], v[1])) register_operator("is_null", lambda s,v: s.isna()) register_operator("not_null", lambda s,v: s.notna())  # ============================================================ # Schema # ============================================================  class Schema:     def __init__(self, cfg):         self.separator = cfg.get("separator", ",")         self.columns = cfg.get("columns")         self.types = cfg.get("types", {})         self.drop = set(cfg.get("drop", []))         self.chunk_size = int(cfg.get("chunk_size", 50000))         self.output = cfg.get("output", "csv")  # ============================================================ # Rules # ============================================================  class Rule:     def __init__(self, field=None, operator=None, value=None,                  expr=None, severity="error", name=None):         self.field = field         self.operator = operator         self.value = value         self.expr = expr         self.severity = severity         self.name = name or field or expr      def apply(self, df):         if self.expr:             return df.eval(self.expr)         return OPERATORS[self.operator](df[self.field], self.value)  class RuleEngine:     def __init__(self, rules, mode="any"):         self.rules = [Rule(**r) for r in rules]         self.mode = mode      def validate(self, columns):         for r in self.rules:             if r.field and r.field not in columns:                 raise ValueError(r.field)      def evaluate(self, df):         err = pd.Series(False, index=df.index)         warn = pd.Series(False, index=df.index)         reason = pd.Series("", index=df.index)          for r in self.rules:             m = r.apply(df)             if r.severity == "error":                 err |= m             else:                 warn |= m             reason[m] += f"{r.name};"          return err, warn, reason  # ============================================================ # Approx Distinct (HyperLogLog Lite) # ============================================================  class HLL:     def __init__(self, buckets=256):         self.buckets = buckets         self.reg = [0]*buckets      def add(self, v):         h = hash(v)         b = h & (self.buckets-1)         w = h >> 8         rank = len(bin(w)) - len(bin(w).rstrip("0"))         self.reg[b] = max(self.reg[b], rank)      def count(self):         return int(self.buckets / sum(2**-r for r in self.reg))  # ============================================================ # Running Stats # ============================================================  class RunningStats:     def __init__(self):         self.n=0         self.mean=0         self.M2=0         self.min=None         self.max=None      def update(self, x):         for v in x.dropna():             self.n+=1             d=v-self.mean             self.mean+=d/self.n             self.M2+=d*(v-self.mean)             self.min=v if self.min is None else min(self.min,v)             self.max=v if self.max is None else max(self.max,v)      def std(self):         return (self.M2/(self.n-1))**0.5 if self.n>1 else 0  # ============================================================ # Stats Detector # ============================================================  class StatsDetector:     def __init__(self, z=3.5):         self.z=z      def detect(self, df):         mask=pd.Series(False,index=df.index)         reason=pd.Series("",index=df.index)          for c in df.columns:             if not pd.api.types.is_numeric_dtype(df[c]):                 continue             med=df[c].median()             mad=np.median(np.abs(df[c]-med))             if mad>0:                 z=0.6745*(df[c]-med)/mad             else:                 std=df[c].std()                 if std==0 or np.isnan(std):                     continue                 z=(df[c]-df[c].mean())/std             m=np.abs(z)>self.z             mask|=m             reason[m]+=f"stat_{c};"         return mask,reason  # ============================================================ # Profiler # ============================================================  class Profiler:     def __init__(self):         self.stats={}      def update(self,df):         for c in df.columns:             st=self.stats.setdefault(c,{                 "rows":0,                 "nulls":0,                 "unique":HLL(),                 "numeric":RunningStats(),                 "top":{}             })             s=df[c]             st["rows"]+=len(s)             st["nulls"]+=int(s.isna().sum())             for v in s.dropna():                 st["unique"].add(v)             if pd.api.types.is_numeric_dtype(s):                 st["numeric"].update(s)             st["top"]=s.value_counts().head(5).to_dict()      def export(self):         out={}         for c,st in self.stats.items():             o={                 "rows":st["rows"],                 "nulls":st["nulls"],                 "unique_estimate":st["unique"].count(),                 "top":st["top"]             }             rs=st["numeric"]             if rs.n>0:                 o.update({"min":rs.min,"max":rs.max,                           "mean":rs.mean,"std":rs.std()})             out[c]=o         return out  # ============================================================ # Writer # ============================================================  class Writer:     def __init__(self,base,mode):         self.base=base         self.mode=mode         self.i=0         os.makedirs(base+"_clean",exist_ok=True)         os.makedirs(base+"_anomalies",exist_ok=True)      def write(self,good,bad):         if self.mode=="parquet":             good.to_parquet(f"{self.base}_clean/{self.i}.parquet")             bad.to_parquet(f"{self.base}_anomalies/{self.i}.parquet")         elif self.mode=="json":             good.to_json(f"{self.base}_clean/{self.i}.jsonl",orient="records",lines=True)             bad.to_json(f"{self.base}_anomalies/{self.i}.jsonl",orient="records",lines=True)         else:             good.to_csv(f"{self.base}_clean/{self.i}.csv",index=False)             bad.to_csv(f"{self.base}_anomalies/{self.i}.csv",index=False)         self.i+=1  # ============================================================ # Engine # ============================================================  class Engine:     def __init__(self,schema=None,rules=None):         self.schema=Schema(json.load(open(schema))) if schema else None         self.rules=RuleEngine(json.load(open(rules)) if rules else [])         self.stats=StatsDetector()         self.profiler=Profiler()         self.samples=[]      def auto_schema(self,path):         with open_file(path) as f:             s=pd.read_csv(f,nrows=200)         return Schema({"columns":list(s.columns),                        "types":{c:infer_type(s[c]) for c in s.columns}})      def cast(self,df):         for c,t in self.schema.types.items():             if t=="int":                 df[c]=pd.to_numeric(df[c],errors="coerce",downcast="integer")             elif t=="float":                 df[c]=pd.to_numeric(df[c],errors="coerce")             elif t=="datetime":                 df[c]=pd.to_datetime(df[c],errors="coerce")         return df      def run(self,path):         if not self.schema:             self.schema=self.auto_schema(path)          self.rules.validate(self.schema.columns)         writer=Writer(os.path.splitext(path)[0],self.schema.output)          reader=pd.read_csv(open_file(path),                            sep=self.schema.separator,                            chunksize=self.schema.chunk_size,                            header=0,dtype=str)          total=clean=bad=0         t0=time.time()          for chunk in reader:             c0=time.time()             chunk=chunk.drop(columns=self.schema.drop,errors="ignore")             chunk=self.cast(chunk)              em,wm,rr=self.rules.evaluate(chunk)             sm,sr=self.stats.detect(chunk)              mask=em|sm             chunk["__error_reason"]=rr+sr              good=chunk[~mask]             bad_rows=chunk[mask]              if len(self.samples)<100:                 self.samples.extend(bad_rows.head(100-len(self.samples)).to_dict("records"))              writer.write(good,bad_rows)             self.profiler.update(chunk.drop(columns="__error_reason"))              total+=len(chunk)             clean+=len(good)             bad+=len(bad_rows)              logging.info(f"chunk_rows={len(chunk)} time={time.time()-c0:.2f}s")          report={             "input":path,             "hash":sha256_file(path),             "finished":datetime.utcnow().isoformat(),             "rows_total":total,             "rows_clean":clean,             "rows_anomalies":bad,             "rows_per_sec":int(total/(time.time()-t0)),             "profile":self.profiler.export(),             "sample_anomalies":self.samples         }          with open(os.path.splitext(path)[0]+"_summary.json","w") as f:             json.dump(report,f,indent=2)          return report  # ============================================================ # CLI # ============================================================  def main():     p=argparse.ArgumentParser()     p.add_argument("--input",required=True)     p.add_argument("--schema")     p.add_argument("--rules")     args=p.parse_args()     e=Engine(args.schema,args.rules)     r=e.run(args.input)     print(json.dumps(r,indent=2))  if __name__=="__main__":     main()
-Expression rules ("expr": "a > b*1.2")
-• Severity rules (error / warning)
-• Approx distinct cardinality
-• Streaming accurate mean/std
-• Sample anomalies
-• Rows/sec метрика
-• Chunk timing
-• Schema drift readiness
-• Hybrid rule types (column + expression)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
 
-Итоговые свойства
+# --- L0-Flow: ГЕОМЕТРИЯ ЗОЛОТОГО СЕЧЕНИЯ ---
+GOLDEN_K = 1.61803398875
 
-• Высокая точность
-• Потоковая математика
-• Расширяемость
-• Производственная устойчивость
-• Готовность к ML / DQ / ETL
-Привет я сделал инструмент для обработки информации можешь его оценить проверить и описать этот инструмент его функционал на что он способен и всё такое спасибо
+def get_coherence_score(signal_slice):
+    if len(signal_slice) < 2: 
+        return 1.0
+    # Проецируем каждое число на фазу Тора
+    phases = [(v * GOLDEN_K) % 1.0 for v in signal_slice]
+    # Считаем векторную сумму (Когерентность)
+    x = np.mean([math.cos(2 * math.pi * p) for p in phases])
+    y = np.mean([math.sin(2 * math.pi * p) for p in phases])
+    return math.sqrt(x**2 + y**2)
+
+# --- ИНТЕРФЕЙС ---
+st.set_page_config(page_title="L0-Flow Test", layout="wide")
+st.title("🛡️ Тест Двигателя: Резонанс vs Хаос")
+
+uploaded_file = st.file_uploader("Загрузи train_FD001.txt", type=['txt'])
+
+if uploaded_file:
+    # 1. Читаем NASA данные
+    df = pd.read_csv(uploaded_file, sep=r"\s+", header=None)
+    engine_id = st.sidebar.selectbox("Выбери Мотор", df[0].unique(), index=0)
+    # Датчик 11 — это "сердце" турбины
+    sensor_idx = 11 
+    
+    raw_values = df[df[0] == engine_id][sensor_idx].values
+    # Нормализация
+    norm = (raw_values - raw_values.min()) / (raw_values.max() - raw_values.min() + 1e-9)
+    
+    # 2. АНАЛИЗ РОЕМ
+    anomaly_map = []
+    window = 5 
+    
+    for i in range(len(norm)):
+        chunk = norm[max(0, i-window):i+1]
+        score = get_coherence_score(chunk)
+        anomaly_map.append((1.0 - score) * 100)
+
+    # 3. ВИЗУАЛИЗАЦИЯ
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📡 Сигнал датчика (Вход)")
+        st.line_chart(raw_values)
+    with col2:
+        st.subheader("🔥 Аномалия по Золотому Сечению (Выход)")
+        st.area_chart(anomaly_map)
+
+    # ВЕРДИКТ
+    final_risk = np.mean(anomaly_map[-10:])
+    if final_risk > 10:
+        st.error(f"ТЕСТ: ПРОВАЛ. Мотор разрушается. Индекс Хаоса: {final_risk:.2f}%")
+    else:
+        st.success(f"ТЕСТ: УСПЕХ. Поток в резонансе. Индекс Хаоса: {final_risk:.2f}%")
+else:
+    st.info("Жду файл NASA для проведения теста...")
