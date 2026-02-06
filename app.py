@@ -1,14 +1,13 @@
 # ================================
-# STREAMLIT + ENGINE (ALL-IN-ONE)
+# STREAMLIT + ENGINE (ALL-IN-ONE) — обновлённый вариант
+# с настраиваемым порогом z и разделителем
 # ================================
 
 import streamlit as st
-import argparse
 import json
 import os
 import gzip
 import hashlib
-import logging
 import time
 from datetime import datetime
 from typing import Dict, Callable
@@ -24,6 +23,8 @@ st.set_page_config(
     page_title="Streaming Data Quality Engine",
     layout="wide"
 )
+
+st.title("🚀 Streaming Data Quality Engine — NASA / другие данные")
 
 # ================================
 # UTILS
@@ -260,10 +261,11 @@ class Profiler:
 # ================================
 
 class Engine:
-    def __init__(self,schema=None,rules=None):
+    def __init__(self,schema=None,rules=None,z_threshold=3.5):
         self.schema=Schema(json.load(open(schema))) if schema else None
         self.rules=RuleEngine(json.load(open(rules)) if rules else [])
-        self.stats=StatsDetector()
+        # use passed z threshold
+        self.stats=StatsDetector(z=z_threshold)
         self.profiler=Profiler()
         self.samples=[]
 
@@ -344,21 +346,91 @@ class Engine:
 # STREAMLIT UI
 # ================================
 
-st.title("🚀 Streaming Data Quality Engine")
+st.sidebar.header("Параметры анализа")
+
+# Порог z: сам можешь менять от 1.5 до 5.0 (например)
+z_threshold = st.sidebar.slider(
+    "Порог z для статистического детектора",
+    min_value=1.5,
+    max_value=5.0,
+    value=3.5,
+    step=0.1,
+    help="Меньше — чувствительнее; больше — жёстче"
+)
+
+# Разделитель: по умолчанию запятая, но можно изменить
+sep_input = st.sidebar.text_input(
+    "Разделитель в файле",
+    value=",",
+    help="Пример: ',' или ' ' (пробел) или '\\t'"
+)
+
+# Опционально: schema.json и rules.json
+schema_file = st.sidebar.file_uploader(
+    "Optional Schema JSON",
+    type=["json"],
+    key="schema"
+)
+rules_file = st.sidebar.file_uploader(
+    "Optional Rules JSON",
+    type=["json"],
+    key="rules"
+)
+
+st.write("Загрузите файл и кликните Run")
 
 file = st.file_uploader("Upload CSV / TXT / GZ", type=["csv","txt","gz"])
 
 if st.button("Run") and file:
 
     with st.spinner("Processing..."):
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(file.read())
-            path = tmp.name
+        # Сохраняем файл во временном месте
+        tmp_dir = tempfile.mkdtemp()
+        path = os.path.join(tmp_dir, file.name)
+        with open(path, "wb") as f:
+            f.write(file.read())
 
-        engine = Engine()
+        # Подготовка schema прямо из разделителя, если schema не загружен
+        schema_path = None
+        if schema_file:
+            schema_path = os.path.join(tmp_dir, "schema.json")
+            with open(schema_path, "wb") as f:
+                f.write(schema_file.read())
+        else:
+            # делаем временный schema только с разделителем
+            tmp_schema = {
+                "separator": sep_input,
+                "columns": None,
+                "types": {},
+                "drop": [],
+                "chunk_size": 50000,
+                "output": "csv"
+            }
+            schema_path = os.path.join(tmp_dir, "temp_schema.json")
+            with open(schema_path, "w") as f:
+                json.dump(tmp_schema, f)
+
+        rules_path = None
+        if rules_file:
+            rules_path = os.path.join(tmp_dir, "rules.json")
+            with open(rules_path, "wb") as f:
+                f.write(rules_file.read())
+        else:
+            # пустые правила
+            tmp_rules = []
+            rules_path = os.path.join(tmp_dir, "temp_rules.json")
+            with open(rules_path, "w") as f:
+                json.dump(tmp_rules, f)
+
+        # Запуск движка с выбранным порогом
+        engine = Engine(schema=schema_path, rules=rules_path, z_threshold=z_threshold)
         report = engine.run(path)
 
     st.success("Done")
+
+    # ---------------------------
+    # Основные метрики
+    # ---------------------------
 
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Rows",report["rows_total"])
@@ -366,15 +438,37 @@ if st.button("Run") and file:
     c3.metric("Anomalies",report["rows_anomalies"])
     c4.metric("Rows/sec",report["rows_per_sec"])
 
+    # ---------------------------
+    # Профиль колонок
+    # ---------------------------
+
     st.subheader("Column Profile")
-    st.dataframe(pd.DataFrame(report["profile"]).T)
+    st.dataframe(pd.DataFrame(report["profile"]).T, use_container_width=True)
+
+    # ---------------------------
+    # Примеры аномалий
+    # ---------------------------
 
     if report["sample_anomalies"]:
         st.subheader("Sample Anomalies")
-        st.dataframe(pd.DataFrame(report["sample_anomalies"]))
+        st.dataframe(pd.DataFrame(report["sample_anomalies"]), use_container_width=True)
+
+    # ---------------------------
+    # Лог/JSON
+    # ---------------------------
 
     st.subheader("Raw JSON")
     st.json(report)
+
+    # ---------------------------
+    # Скачать отчёт
+    # ---------------------------
+
+    st.download_button(
+        "Download Report JSON",
+        json.dumps(report, indent=2),
+        "summary.json"
+    )
 
 else:
     st.info("Upload file and click Run")
