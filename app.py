@@ -11,62 +11,70 @@ def get_torus_projection(value, K):
     angle = 2 * math.pi * (value * K % 1.0)
     return math.cos(angle), math.sin(angle)
 
-def calculate_resonance(values, K):
-    if not values: return 0
+def calculate_resonance(window_data, K):
+    # Проверка на пустоту для NumPy
+    if len(window_data) == 0: 
+        return 1.0
+    
     # Вычисляем средний вектор когерентности на Торе
-    vectors = [get_torus_projection(v, K) for v in values]
+    vectors = [get_torus_projection(v, K) for v in window_data]
     avg_x = sum(v[0] for v in vectors) / len(vectors)
     avg_y = sum(v[1] for v in vectors) / len(vectors)
-    # Длина вектора R: 1.0 — идеальный резонанс, 0.0 — хаос
+    
+    # Длина вектора R: 1.0 — идеальный резонанс, 0.0 — полный хаос
     return math.sqrt(avg_x**2 + avg_y**2)
 
 # --- UI ---
-st.set_page_config(page_title="Sovereign Torus", layout="wide")
+st.set_page_config(page_title="Sovereign Torus Lab", layout="wide")
 st.title("💠 L0-Flow: Torus Resonance Diagnostic")
-st.write("Анализ проекции сигнала на Золотое Сечение (K=1.618)")
+st.write("Место действия: Ренаццо. Проекция на Тор через Золотое Сечение.")
 
 uploaded_file = st.file_uploader("Загрузи train_FD001.txt", type=['txt'])
 
 if uploaded_file:
+    # Используем r"\s+" чтобы избежать предупреждений в логах
     df = pd.read_csv(uploaded_file, sep=r"\s+", header=None)
-    engine_id = st.sidebar.selectbox("ID Двигателя", df[0].unique())
-    # Датчик 11 (Давление) — он лучше всего "гуляет" на Торе
-    sensor_idx = st.sidebar.slider("Сенсор", 2, 25, 11)
+    
+    engine_id = st.sidebar.selectbox("ID Двигателя", df[0].unique(), index=0)
+    # Датчик 11 — давление, Датчик 4 — температура
+    sensor_idx = st.sidebar.slider("Сенсор (11 - лучший для аномалий)", 2, 25, 11)
     
     raw_data = df[df[0] == engine_id][sensor_idx].values
-    # Нормализация
+    # Нормализация (Сигнал в диапазон 0-1 для Тора)
     norm = (raw_data - raw_data.min()) / (raw_data.max() - raw_data.min() + 1e-9)
     
-    resonance_map = []
     anomaly_power = []
-
-    # Скользящее окно для анализа "дыхания" Тора
+    
+    # Скользящее окно: Рой смотрит на 5 шагов сразу
     window_size = 5
     for i in range(len(norm)):
         window = norm[max(0, i-window_size):i+1]
-        # Резонанс относительно Золотого Сечения
-        R = calculate_resonance(window, GOLDEN_RATIO)
-        resonance_map.append(R)
         
-        # Аномалия — это когда структура ПАДАЕТ (Resonance < 1)
-        # Мы инвертируем это, чтобы видеть "взрыв" проблемы
-        anomaly_power.append(1.0 - R)
+        # Считаем резонанс текущего момента с Золотым Сечением
+        R = calculate_resonance(window, GOLDEN_RATIO)
+        
+        # Аномалия — это "деформация" Тора (1.0 - R)
+        # Усиливаем микро-колебания в 100 раз
+        anomaly_power.append((1.0 - R) * 100)
 
     # ВИЗУАЛИЗАЦИЯ
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write("### Состояние мотора (Raw Signal)")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Сырой сигнал (NASA Sensor)")
         st.line_chart(raw_data)
-    with c2:
-        st.write("### Деструкция Тора (Anomaly Resonance)")
-        # Умножаем на коэффициент, чтобы видеть микро-трещины
-        st.area_chart([a * 100 for a in anomaly_power])
+    with col2:
+        st.subheader("Деформация Тора (Resonance Anomaly)")
+        # Это график того, как мотор "вылетает" из Золотого Сечения
+        st.area_chart(anomaly_power)
 
-    # СТАТУС
-    current_decay = np.mean(anomaly_power[-10:]) * 100
-    if current_decay > 5:
-        st.error(f"🛑 ВНИМАНИЕ! Тор деформирован. Коэффициент деструкции: {current_decay:.2f}%")
+    # ВЕРДИКТ
+    current_anomaly = np.mean(anomaly_power[-10:])
+    if current_anomaly > 10:
+        st.error(f"⚠️ КРИТИЧЕСКАЯ ДЕФОРМАЦИЯ: {current_anomaly:.2f}%. Структура Тора разрушена.")
+    elif current_anomaly > 3:
+        st.warning(f"⚡ ПРЕД-АНОМАЛИЯ: {current_anomaly:.2f}%. Появление 'шума' в резонансе.")
     else:
-        st.success(f"💎 ГЕОМЕТРИЯ СТАБИЛЬНА. Резонанс с Золотым Сечением в норме.")
+        st.success(f"💎 ИДЕАЛЬНЫЙ РЕЗОНАНС: {current_anomaly:.2f}%. Тор стабилен.")
 
-    st.info("💡 Лайфхак для Lamborghini: Обрати внимание, как правый график начинает 'шуметь' задолго до того, как левый покажет явный рост.")
+else:
+    st.info("Загрузи файл, чтобы запустить проекцию на Тор.")
