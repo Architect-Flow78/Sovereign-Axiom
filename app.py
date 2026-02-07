@@ -1,5 +1,5 @@
 # ============================================================
-# STREAMLIT — NASA CMAPSS FD001 DEGRADATION ENGINE (FINAL)
+# STREAMLIT — NASA CMAPSS FD001 VERIFICATION VERSION
 # ============================================================
 
 import streamlit as st
@@ -11,28 +11,22 @@ import time
 import tempfile
 import os
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 # ============================================================
 # STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="NASA CMAPSS Degradation Engine",
+    page_title="NASA CMAPSS Degradation Verifier",
     layout="wide"
 )
 
-st.title("🚀 NASA CMAPSS FD001 – Degradation Detection Engine")
+st.title("🚀 NASA CMAPSS FD001 — Verification Dashboard")
 
 # ============================================================
 # UTILS
 # ============================================================
-
-def sha256_file(path, block=1 << 20):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(block), b""):
-            h.update(b)
-    return h.hexdigest()
 
 def open_file(path):
     if path.endswith(".gz"):
@@ -40,18 +34,11 @@ def open_file(path):
     return open(path, "r", encoding="utf-8", errors="replace")
 
 # ============================================================
-# DEGRADATION DETECTOR (NASA-OPTIMIZED)
+# DEGRADATION DETECTOR
 # ============================================================
 
 class DegradationDetector:
-    def __init__(
-        self,
-        baseline_frac=0.2,
-        late_frac=0.3,
-        mean_sigma=1.5,
-        slope_thresh=0.0005
-    ):
-        self.baseline_frac = baseline_frac
+    def __init__(self, late_frac=0.3, mean_sigma=1.5, slope_thresh=0.0005):
         self.late_frac = late_frac
         self.mean_sigma = mean_sigma
         self.slope_thresh = slope_thresh
@@ -60,10 +47,7 @@ class DegradationDetector:
         mask = pd.Series(False, index=df.index)
         reason = pd.Series("", index=df.index)
 
-        numeric_cols = [
-            c for c in df.columns
-            if c.startswith("sensor_")
-        ]
+        sensors = [c for c in df.columns if c.startswith("sensor_")]
 
         for eng_id, g in df.groupby("engine_id"):
             g = g.sort_values("cycle")
@@ -71,173 +55,120 @@ class DegradationDetector:
             if n < 50:
                 continue
 
-            b_end = int(n * self.baseline_frac)
-            l_start = int(n * (1 - self.late_frac))
-
-            base = g.iloc[:b_end]
-            late = g.iloc[l_start:]
+            split = int(n * (1 - self.late_frac))
+            base = g.iloc[:split]
+            late = g.iloc[split:]
 
             degraded = False
-            degraded_sensors = []
-
-            for c in numeric_cols:
+            for c in sensors:
                 b = base[c].dropna()
                 l = late[c].dropna()
                 if len(b) < 10 or len(l) < 10:
                     continue
-
-                sigma = b.std()
-                mean_shift = abs(l.mean() - b.mean())
-                mean_anom = sigma > 0 and mean_shift > self.mean_sigma * sigma
-
-                x = g["cycle"].values
-                y = g[c].values
-                if np.std(y) == 0:
-                    continue
-                slope = np.polyfit(x, y, 1)[0]
-                slope_anom = abs(slope) > self.slope_thresh
-
-                if mean_anom or slope_anom:
+                if abs(l.mean() - b.mean()) > self.mean_sigma * b.std():
                     degraded = True
-                    degraded_sensors.append(c)
 
             if degraded:
-                late_idx = g.index[g["cycle"] >= g["cycle"].quantile(1 - self.late_frac)]
-                mask.loc[late_idx] = True
-                for c in degraded_sensors:
-                    reason.loc[late_idx] += f"degradation_{c};"
+                mask.loc[late.index] = True
+                reason.loc[late.index] = "degradation"
 
         return mask, reason
-
-# ============================================================
-# PROFILER
-# ============================================================
-
-class Profiler:
-    def __init__(self):
-        self.stats = {}
-
-    def update(self, df):
-        for c in df.columns:
-            stt = self.stats.setdefault(c, {
-                "rows": 0,
-                "nulls": 0,
-                "mean": None,
-                "std": None,
-                "min": None,
-                "max": None
-            })
-            s = df[c]
-            stt["rows"] += len(s)
-            stt["nulls"] += int(s.isna().sum())
-            if pd.api.types.is_numeric_dtype(s):
-                stt["mean"] = float(s.mean())
-                stt["std"] = float(s.std())
-                stt["min"] = float(s.min())
-                stt["max"] = float(s.max())
-
-    def export(self):
-        return self.stats
 
 # ============================================================
 # ENGINE
 # ============================================================
 
-class Engine:
-    def __init__(self):
-        self.detector = DegradationDetector()
-        self.profiler = Profiler()
-        self.samples = []
+def run_engine(path):
+    columns = (
+        ["engine_id", "cycle"]
+        + [f"op_{i}" for i in range(1, 4)]
+        + [f"sensor_{i}" for i in range(1, 22)]
+    )
 
-    def run(self, path):
-        columns = (
-            ["engine_id", "cycle"]
-            + [f"op_{i}" for i in range(1, 4)]
-            + [f"sensor_{i}" for i in range(1, 22)]
-        )
+    df = pd.read_csv(open_file(path), sep=r"\s+", names=columns)
+    df = df.apply(pd.to_numeric, errors="coerce")
 
-        reader = pd.read_csv(
-            open_file(path),
-            sep=r"\s+",
-            names=columns,
-            chunksize=50000
-        )
+    detector = DegradationDetector()
+    mask, reason = detector.detect(df)
 
-        total = clean = bad = 0
-        t0 = time.time()
+    df["is_degraded"] = mask
+    df["reason"] = reason
 
-        for chunk in reader:
-            chunk = chunk.apply(pd.to_numeric, errors="coerce")
-
-            # RUL proxy
-            max_cycle = chunk.groupby("engine_id")["cycle"].transform("max")
-            chunk["rul_proxy"] = max_cycle - chunk["cycle"]
-
-            sm, sr = self.detector.detect(chunk)
-            chunk["__reason"] = sr
-
-            good = chunk[~sm]
-            bad_rows = chunk[sm]
-
-            if len(self.samples) < 100:
-                self.samples.extend(
-                    bad_rows.head(100 - len(self.samples)).to_dict("records")
-                )
-
-            self.profiler.update(chunk.drop(columns="__reason"))
-
-            total += len(chunk)
-            clean += len(good)
-            bad += len(bad_rows)
-
-        return {
-            "rows_total": total,
-            "rows_clean": clean,
-            "rows_anomalies": bad,
-            "rows_per_sec": int(total / max(time.time() - t0, 1)),
-            "profile": self.profiler.export(),
-            "sample_anomalies": self.samples,
-            "hash": sha256_file(path),
-            "finished": datetime.utcnow().isoformat()
-        }
+    return df
 
 # ============================================================
 # STREAMLIT UI
 # ============================================================
 
 uploaded_file = st.file_uploader(
-    "Upload NASA CMAPSS file (train_FD001.txt)",
+    "Upload NASA CMAPSS train_FD001.txt",
     type=["txt", "gz"]
 )
 
-if st.button("🚀 Run Engine") and uploaded_file:
+if uploaded_file and st.button("🚀 Run Engine"):
 
     with st.spinner("Processing..."):
-        tmp_dir = tempfile.mkdtemp()
-        path = os.path.join(tmp_dir, uploaded_file.name)
-        with open(path, "wb") as f:
-            f.write(uploaded_file.read())
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(uploaded_file.read())
+        tmp.close()
 
-        engine = Engine()
-        report = engine.run(path)
+        df = run_engine(tmp.name)
 
     st.success("Done")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", report["rows_total"])
-    c2.metric("Clean", report["rows_clean"])
-    c3.metric("Anomalies", report["rows_anomalies"])
-    c4.metric("Rows/sec", report["rows_per_sec"])
+    # ---------------- Metrics ----------------
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows", len(df))
+    c2.metric("Clean", int((~df["is_degraded"]).sum()))
+    c3.metric("Degraded", int(df["is_degraded"].sum()))
 
-    st.subheader("Column Profile")
-    st.dataframe(pd.DataFrame(report["profile"]).T, width="stretch")
+    # ---------------- Downloads ----------------
+    st.subheader("📥 Download data")
 
-    if report["sample_anomalies"]:
-        st.subheader("Sample Degradation Rows (Late Cycles)")
-        st.dataframe(pd.DataFrame(report["sample_anomalies"]), width="stretch")
+    st.download_button(
+        "Download CLEAN rows (CSV)",
+        df[~df["is_degraded"]].to_csv(index=False),
+        "clean_rows.csv"
+    )
 
-    st.subheader("Raw Report")
-    st.json(report)
+    st.download_button(
+        "Download DEGRADED rows (CSV)",
+        df[df["is_degraded"]].to_csv(index=False),
+        "degraded_rows.csv"
+    )
+
+    # ---------------- Graph ----------------
+    st.subheader("📈 Degradation visualization")
+
+    engine_ids = sorted(df["engine_id"].unique())
+    engine_id = st.selectbox("Select engine_id", engine_ids)
+
+    sensor = st.selectbox(
+        "Select sensor",
+        [c for c in df.columns if c.startswith("sensor_")]
+    )
+
+    g = df[df["engine_id"] == engine_id]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(g["cycle"], g[sensor], label="sensor", alpha=0.6)
+    ax.scatter(
+        g[g["is_degraded"]]["cycle"],
+        g[g["is_degraded"]][sensor],
+        color="red",
+        s=10,
+        label="degraded"
+    )
+    ax.set_xlabel("cycle")
+    ax.set_ylabel(sensor)
+    ax.legend()
+
+    st.pyplot(fig)
+
+    st.info(
+        "👉 Сделай скриншот этого графика и пришли сюда в чат.\n"
+        "Мы посмотрим, совпадает ли деградация с физикой отказа."
+    )
 
 else:
-    st.info("Upload train_FD001.txt and click Run")
+    st.info("Upload file and press Run Engine")
