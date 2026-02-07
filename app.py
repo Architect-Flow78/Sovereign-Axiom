@@ -1,17 +1,16 @@
 # ============================================================
-# STREAMLIT — NASA CMAPSS FD001 VERIFICATION VERSION
+# STREAMLIT — NASA CMAPSS FD001 VERIFICATION VERSION (FIXED)
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import gzip
-import hashlib
 import time
 import tempfile
 import os
 from datetime import datetime
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt   # ✅ ИСПРАВЛЕНО
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -38,10 +37,9 @@ def open_file(path):
 # ============================================================
 
 class DegradationDetector:
-    def __init__(self, late_frac=0.3, mean_sigma=1.5, slope_thresh=0.0005):
+    def __init__(self, late_frac=0.3, mean_sigma=1.5):
         self.late_frac = late_frac
         self.mean_sigma = mean_sigma
-        self.slope_thresh = slope_thresh
 
     def detect(self, df):
         mask = pd.Series(False, index=df.index)
@@ -65,7 +63,7 @@ class DegradationDetector:
                 l = late[c].dropna()
                 if len(b) < 10 or len(l) < 10:
                     continue
-                if abs(l.mean() - b.mean()) > self.mean_sigma * b.std():
+                if b.std() > 0 and abs(l.mean() - b.mean()) > self.mean_sigma * b.std():
                     degraded = True
 
             if degraded:
@@ -156,7 +154,7 @@ if uploaded_file and st.button("🚀 Run Engine"):
         g[g["is_degraded"]]["cycle"],
         g[g["is_degraded"]][sensor],
         color="red",
-        s=10,
+        s=12,
         label="degraded"
     )
     ax.set_xlabel("cycle")
@@ -166,8 +164,8 @@ if uploaded_file and st.button("🚀 Run Engine"):
     st.pyplot(fig)
 
     st.info(
-        "👉 Сделай скриншот этого графика и пришли сюда в чат.\n"
-        "Мы посмотрим, совпадает ли деградация с физикой отказа."
+        "👉 Сделай скриншот графика и пришли его сюда.\n"
+        "По нему мы точно скажем, корректно ли работает детектор."
     )
 
 else:
