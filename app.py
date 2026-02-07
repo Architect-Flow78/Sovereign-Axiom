@@ -2,8 +2,46 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+import hashlib
+import time
+from datetime import datetime
 
-# --- CORE: ИНВАРИАНТ ГЕОМЕТРИИ (IGA) ---
+# ============================================================
+# CORE 1: ТВОЙ ПРОМЫШЛЕННЫЙ БЛОК (UTILS & STATS)
+# ============================================================
+
+class HLL:
+    def __init__(self, buckets=256):
+        self.buckets = buckets
+        self.reg = [0]*buckets
+    def add(self, v):
+        h = hash(str(v))
+        b = h & (self.buckets-1)
+        w = h >> 8
+        rank = len(bin(w)) - len(bin(w).rstrip("0"))
+        self.reg[b] = max(self.reg[b], rank)
+    def count(self):
+        return int(self.buckets / (sum(2**-r for r in self.reg) + 1e-9))
+
+class RunningStats:
+    def __init__(self):
+        self.n, self.mean, self.M2 = 0, 0, 0
+        self.min, self.max = None, None
+    def update(self, x_series):
+        for v in x_series.dropna():
+            self.n += 1
+            d = v - self.mean
+            self.mean += d / self.n
+            self.M2 += d * (v - self.mean)
+            self.min = v if self.min is None else min(self.min, v)
+            self.max = v if self.max is None else max(self.max, v)
+    def std(self):
+        return (self.M2 / (self.n - 1))**0.5 if self.n > 1 else 0
+
+# ============================================================
+# CORE 2: НАШ РЕЗОНАНСНЫЙ БЛОК (TORUS / GOLDEN RATIO)
+# ============================================================
+
 GOLDEN_K = 1.61803398875
 
 def get_coherence_score(signal_slice):
@@ -13,71 +51,90 @@ def get_coherence_score(signal_slice):
     y = np.mean([math.sin(2 * math.pi * p) for p in phases])
     return math.sqrt(x**2 + y**2)
 
-# --- UI ---
-st.set_page_config(page_title="Axioma Lab Stand", layout="wide")
-st.title("🔬 Axioma Flow: Лабораторный Тест")
+# ============================================================
+# INTERFACE: STREAMLIT LAB STAND
+# ============================================================
 
-uploaded_file = st.file_uploader("Загрузи train_FD001.txt для теста", type=['txt'])
+st.set_page_config(page_title="Axioma Flow: Renazzo-X", layout="wide")
+st.title("💠 Axioma Flow | Renazzo-X Engine")
+st.write("Индустриальный анализатор потоков телеметрии (L0-Flow Protocol)")
+
+uploaded_file = st.file_uploader("Загрузи train_FD001.txt", type=['txt'])
 
 if uploaded_file:
-    # --- НАСТРОЙКИ "НЕЖНОСТИ" (Calibration) ---
-    st.sidebar.header("Настройка прибора")
-    sensitivity = st.sidebar.slider("Чувствительность (Sensitivity)", 0.1, 2.0, 1.0, help="Чем выше, тем раньше бьем тревогу")
-    window_size = st.sidebar.slider("Окно анализа (Window)", 3, 20, 7, help="Размер выборки для поиска резонанса")
-    noise_threshold = st.sidebar.slider("Порог шума (Noise Floor %)", 0, 20, 5)
-
+    # 1. Загрузка данных (Имитируем твой Engine.run)
     df = pd.read_csv(uploaded_file, sep=r"\s+", header=None)
-    engine_id = st.sidebar.selectbox("ID Двигателя", df[0].unique(), index=0)
     
-    # Датчик 11 (Давление на выходе из ЛПЦ)
-    raw_values = df[df[0] == engine_id][11].values
-    cycles = df[df[0] == engine_id][1].values
+    # Настройки прибора
+    st.sidebar.header("Калибровка системы")
+    engine_id = st.sidebar.selectbox("ID Двигателя", df[0].unique())
+    sensor_idx = st.sidebar.slider("Сенсор (11 - Давление)", 2, 25, 11)
+    sensitivity = st.sidebar.slider("Чувствительность", 0.1, 3.0, 1.2)
+    noise_floor = st.sidebar.slider("Порог шума (%)", 0, 20, 8)
     
-    # Нормализация
+    # Выборка данных
+    engine_data = df[df[0] == engine_id].copy()
+    raw_values = engine_data[sensor_idx].values
+    cycles = engine_data[1].values
+    
+    # 2. Профилирование (Твой Profiler)
+    hll = HLL()
+    rs = RunningStats()
+    for v in raw_values: hll.add(v)
+    rs.update(pd.Series(raw_values))
+    
+    # 3. Анализ Резонанса (IGA)
     norm = (raw_values - raw_values.min()) / (raw_values.max() - raw_values.min() + 1e-9)
+    chaos_map = []
     
-    # --- АНАЛИЗ ---
-    results = []
-    # Калибровка по первым 20 циклам (эталон здоровья)
-    baseline_scores = [get_coherence_score(norm[max(0, i-window_size):i+1]) for i in range(20)]
+    # Калибровка по первым 25 циклам
+    ref_window = 10
+    baseline_scores = [get_coherence_score(norm[max(0, i-ref_window):i+1]) for i in range(25)]
     health_ref = np.mean(baseline_scores)
-
+    
+    log_entries = []
+    
     for i in range(len(norm)):
-        chunk = norm[max(0, i-window_size):i+1]
+        chunk = norm[max(0, i-ref_window):i+1]
         score = get_coherence_score(chunk)
+        # Формула Хаоса
+        chaos_idx = max(0, (health_ref - score) * 100 * sensitivity)
+        if chaos_idx < noise_floor: chaos_idx = 0
         
-        # Вычисляем Хаос с учетом чувствительности
-        chaos = max(0, (health_ref - score) * 100 * sensitivity)
+        chaos_map.append(chaos_idx)
         
-        # Фильтруем фоновый шум
-        if chaos < noise_threshold: chaos = 0
-            
-        results.append({
-            "Cycle": int(cycles[i]),
-            "Value": raw_values[i],
-            "Chaos": round(chaos, 2),
-            "Coherence": round(score, 4)
-        })
+        if i > 30 and chaos_idx > 15:
+            log_entries.append({
+                "Cycle": int(cycles[i]),
+                "Value": round(raw_values[i], 2),
+                "Chaos_Index": round(chaos_idx, 2),
+                "Status": "🛑 CRITICAL" if chaos_idx > 35 else "⚠️ WARNING"
+            })
 
-    res_df = pd.DataFrame(results)
+    # 4. Визуализация
+    col1, col2, col3 = st.columns([1, 1, 1])
+    col1.metric("Unique Vals (HLL)", hll.count())
+    col2.metric("Mean Value", round(rs.mean, 2))
+    col3.metric("Std Dev", round(rs.std(), 2))
 
-    # --- ВИЗУАЛИЗАЦИЯ ТЕСТА ---
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Показания датчика")
-        st.line_chart(res_df.set_index("Cycle")["Value"])
-    with c2:
-        st.subheader("Индекс Хаоса (Твое 'Золотое Сечение')")
-        st.area_chart(res_df.set_index("Cycle")["Chaos"])
+    tab1, tab2 = st.tabs(["📉 Графики", "📋 Технический отчет"])
+    
+    with tab1:
+        c1, c2 = st.columns(2)
+        c1.subheader("Сенсор (Телеметрия)")
+        c1.line_chart(raw_values)
+        c2.subheader("Индекс Хаоса (L0-Flow)")
+        c2.area_chart(chaos_map)
 
-    # --- ПРОВЕРКА ТОЧНОСТИ ---
-    st.subheader("📊 Протокол испытаний")
-    
-    # Ищем точку первого обнаружения
-    detection_point = res_df[res_df["Chaos"] > 15].head(1)
-    
-    if not detection_point.empty:
-        st.warning(f"🎯 Прибор зафиксировал аномалию на цикле: **{detection_point.iloc[0]['Cycle']}**")
-        st.info(f"Фактическая смерть мотора: **{res_df.iloc[-1]['Cycle']}** цикл. Запас времени: **{int(res_df.iloc[-1]['Cycle'] - detection_point.iloc[0]['Cycle'])}** циклов.")
-    
-    st.dataframe(res_df[res_df["Chaos"] > 0], use_container_width=True)
+    with tab2:
+        if log_entries:
+            st.dataframe(pd.DataFrame(log_entries), use_container_width=True)
+        else:
+            st.success("Аномалий не зафиксировано. Система в резонансе.")
+
+    # Хеш файла (как в твоем коде)
+    file_hash = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+    st.caption(f"File SHA-256: {file_hash} | Engine: Renazzo-X v2.1")
+
+else:
+    st.info("Ожидание потока данных...")
