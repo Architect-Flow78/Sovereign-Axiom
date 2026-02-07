@@ -1,16 +1,13 @@
 # ============================================================
-# STREAMLIT — NASA CMAPSS FD001 VERIFICATION VERSION (FIXED)
+# STREAMLIT — NASA CMAPSS FD001 VERIFICATION (NO matplotlib)
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import gzip
-import time
 import tempfile
 import os
-from datetime import datetime
-import matplotlib.pyplot as plt   # ✅ ИСПРАВЛЕНО
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -43,7 +40,6 @@ class DegradationDetector:
 
     def detect(self, df):
         mask = pd.Series(False, index=df.index)
-        reason = pd.Series("", index=df.index)
 
         sensors = [c for c in df.columns if c.startswith("sensor_")]
 
@@ -68,9 +64,8 @@ class DegradationDetector:
 
             if degraded:
                 mask.loc[late.index] = True
-                reason.loc[late.index] = "degradation"
 
-        return mask, reason
+        return mask
 
 # ============================================================
 # ENGINE
@@ -87,10 +82,7 @@ def run_engine(path):
     df = df.apply(pd.to_numeric, errors="coerce")
 
     detector = DegradationDetector()
-    mask, reason = detector.detect(df)
-
-    df["is_degraded"] = mask
-    df["reason"] = reason
+    df["is_degraded"] = detector.detect(df)
 
     return df
 
@@ -138,34 +130,31 @@ if uploaded_file and st.button("🚀 Run Engine"):
     # ---------------- Graph ----------------
     st.subheader("📈 Degradation visualization")
 
-    engine_ids = sorted(df["engine_id"].unique())
-    engine_id = st.selectbox("Select engine_id", engine_ids)
+    engine_id = st.selectbox(
+        "Select engine_id",
+        sorted(df["engine_id"].unique())
+    )
 
     sensor = st.selectbox(
         "Select sensor",
         [c for c in df.columns if c.startswith("sensor_")]
     )
 
-    g = df[df["engine_id"] == engine_id]
+    g = df[df["engine_id"] == engine_id][["cycle", sensor, "is_degraded"]]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(g["cycle"], g[sensor], label="sensor", alpha=0.6)
-    ax.scatter(
-        g[g["is_degraded"]]["cycle"],
-        g[g["is_degraded"]][sensor],
-        color="red",
-        s=12,
-        label="degraded"
+    st.line_chart(
+        g.set_index("cycle")[sensor],
+        height=250
     )
-    ax.set_xlabel("cycle")
-    ax.set_ylabel(sensor)
-    ax.legend()
 
-    st.pyplot(fig)
+    st.scatter_chart(
+        g[g["is_degraded"]].set_index("cycle")[sensor],
+        height=250
+    )
 
     st.info(
-        "👉 Сделай скриншот графика и пришли его сюда.\n"
-        "По нему мы точно скажем, корректно ли работает детектор."
+        "🔴 Точки на scatter-графике — деградация.\n"
+        "📸 Сделай скриншот и пришли сюда."
     )
 
 else:
